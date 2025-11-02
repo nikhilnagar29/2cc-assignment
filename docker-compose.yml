@@ -1,0 +1,49 @@
+# This is the master file to run your entire stack
+version: '3.8'
+
+services:
+  # --- 1. Your Node.js Application ---
+  app:
+    build: .  # Build the image from the Dockerfile in this directory
+    container_name: trading-app
+    ports:
+      - "3000:3000" # Expose your app's port 3000 to your host machine
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      # These variables are passed to your server.js
+      # Use the *service names* for the hosts
+      - NODE_ENV=production
+      - PORT=3000
+      - POSTGRES_HOST=postgres
+      - POSTGRES_USER=trading_user
+      - POSTGRES_PASSWORD=your_strong_password
+      - POSTGRES_DB=trading_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+
+  # --- 2. The Postgres Database ---
+  postgres:
+    image: postgres:15-alpine # Use an official, lightweight Postgres image
+    container_name: trading-db
+    ports:
+      - "5432:5432" # Expose DB port to host (for debugging)
+    environment:
+      # These variables create the database and user on first run
+      - POSTGRES_USER=trading_user
+      - POSTGRES_PASSWORD=your_strong_password
+      - POSTGRES_DB=trading_db
+    volumes:
+      - pgdata:/var/lib/postgresql/data # Persist data even if container stops
+
+  # --- 3. The Redis Cache ---
+  redis:
+    image: redis:7-alpine # Use an official, lightweight Redis image
+    container_name: trading-redis
+    ports:
+      - "6379:6379" # Expose Redis port to host (for debugging)
+
+# Define the named volume for persisting Postgres data
+volumes:
+  pgdata:
