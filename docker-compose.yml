@@ -35,7 +35,8 @@ services:
       - POSTGRES_PASSWORD=your_strong_password
       - POSTGRES_DB=trading_db
     volumes:
-      - pgdata:/var/lib/postgresql/data # Persist data even if container stops
+      - ./src/db/database.sql:/docker-entrypoint-initdb.d/database.sql:ro
+      - pgdata:/var/lib/postgresql/data
 
   # --- 3. The Redis Cache ---
   redis:

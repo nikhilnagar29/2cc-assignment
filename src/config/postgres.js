@@ -1,38 +1,50 @@
-// src/db.js
-// This file configures and exports your Postgres connection pool
-
+// src/config/postgres.js
 const { Pool } = require('pg');
 
-// The pool will automatically use the environment variables
-// we set in docker-compose.yml:
-// - POSTGRES_USER
-// - POSTGRES_HOST
-// - POSTGRES_DB
-// - POSTGRES_PASSWORD
+// 1. --- EXPLICITLY read the env vars ---
+// This fixes the POSTGRES_ vs PG_ bug.
 const pool = new Pool({
-  // You can add more specific configs here if needed,
-  // but the defaults from env vars are usually enough.
-  max: 20, // Max number of clients in the pool
-  idleTimeoutMillis: 30000, // How long a client is allowed to be idle
-  connectionTimeoutMillis: 2000, // How long to wait for a connection
+  user: process.env.POSTGRES_USER,
+  host: process.env.POSTGRES_HOST,
+  database: process.env.POSTGRES_DB,
+  password: process.env.POSTGRES_PASSWORD,
+  port: parseInt(process.env.POSTGRES_PORT || '5432'), // Ensure port is a number
+  
+  // Pool configuration
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
 });
 
-// Optional: Add a listener for connection errors
+// 2. --- Log errors from idle clients ---
 pool.on('error', (err, client) => {
-  console.error('Unexpected error on idle client', err);
+  console.error('Unexpected error on idle Postgres client', err);
   process.exit(-1);
 });
 
-console.log('Postgres connection pool created.');
-
-// Export a query function that will be used by all your services
+// 3. --- Export the pool and a query function ---
 module.exports = {
+  // Export the pool for advanced use (like transactions)
+  pool,
+  
   /**
+   * Dedicated query function.
    * @param {string} text The SQL query text
    * @param {Array<any>} params The parameters for the query
    */
   query: (text, params) => pool.query(text, params),
 
-  // Export the pool itself if you need to manually manage clients (e.g., for transactions)
-  getPool: () => pool,
+  /**
+   * 4. --- EXPORT A CONNECTION TESTER ---
+   * We will call this from server.js *before* starting the app.
+   */
+  connect: async () => {
+    try {
+      await pool.query('SELECT NOW()'); // A simple, fast query to test auth
+      console.log('Postgres connection pool created and connection tested.');
+    } catch (err) {
+      console.error('CRITICAL: Failed to connect to Postgres database.', err.stack);
+      process.exit(1); // Exit the app if we can't connect to the DB
+    }
+  }
 };

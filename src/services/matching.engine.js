@@ -14,7 +14,7 @@ async function processOrderJob(job) {
   // Cast to Number for safe math, as Postgres/Redis can return strings
   const order = {
     ...job.data,
-    price: Number(job.data.price),
+    price: Number(job.data.price) || null, // Ensure null price for market orders
     quantity: Number(job.data.quantity),
     filled_quantity: Number(job.data.filled_quantity)
   };
@@ -41,8 +41,6 @@ async function processOrderJob(job) {
 
 /**
  * Processes a MARKET order.
- * It will take liquidity from the book until it's filled or the book is empty.
- * It cannot rest on the book.
  */
 async function matchMarketOrder(takerOrder) {
   // Process the matching loop
@@ -62,8 +60,6 @@ async function matchMarketOrder(takerOrder) {
 
 /**
  * Processes a LIMIT order.
- * It will first try to take liquidity. If any quantity remains,
- * it will be added to the order book to rest.
  */
 async function matchLimitOrder(takerOrder) {
   // 1. Process the matching loop
@@ -76,6 +72,8 @@ async function matchLimitOrder(takerOrder) {
     const restingOrder = {
       ...updatedTakerOrder,
       quantity: remainingQty, // The *remaining* quantity rests on the book
+      // We pass the *current* filled_quantity to be stored
+      total_filled_quantity: updatedTakerOrder.filled_quantity
     };
 
     await addOrderToBook(restingOrder);
@@ -100,9 +98,6 @@ async function matchLimitOrder(takerOrder) {
 
 /**
  * The core matching loop.
- * Takes the incoming (taker) order and matches it against resting (maker) orders.
- * Modifies the takerOrder object in-place with new filled_quantity.
- * @returns {Promise<object>} The updated takerOrder
  */
 async function processMatchingLoop(takerOrder) {
   const opposingSide = (takerOrder.side === 'buy') ? 'asks' : 'bids';
@@ -117,20 +112,17 @@ async function processMatchingLoop(takerOrder) {
     // 1. Find the best price from the opposing book
     const [bestPrice] = await redis[priceSortCmd](pricesKey, 0, 0);
     if (!bestPrice) {
-      // Opposing book is empty, stop matching
       break; 
     }
-
     const bestPriceNum = Number(bestPrice);
 
     // 2. Check for price match (for LIMIT orders)
     if (takerOrder.type === 'limit') {
       const canMatch = (takerOrder.side === 'buy')
-        ? (takerOrder.price >= bestPriceNum) // Taker BUY price must be >= Maker SELL price
-        : (takerOrder.price <= bestPriceNum); // Taker SELL price must be <= Maker BUY price
+        ? (takerOrder.price >= bestPriceNum)
+        : (takerOrder.price <= bestPriceNum);
       
       if (!canMatch) {
-        // Taker's limit price isn't good enough, stop matching
         break;
       }
     }
@@ -139,12 +131,9 @@ async function processMatchingLoop(takerOrder) {
     const tradePrice = bestPriceNum;
     const priceListKey = `${opposingSide}:${tradePrice}`;
     
-    // Atomically get and remove the first order from the list
     const makerOrderId = await redis.lpop(priceListKey);
     
     if (!makerOrderId) {
-      // This should not happen if ZSET and LISTs are in sync
-      // But if it does, clean up the "empty" price level from the ZSET and continue
       console.warn(`Orphan price level found: ${priceListKey}. Cleaning up.`);
       await redis.zrem(pricesKey, bestPrice);
       continue;
@@ -153,23 +142,27 @@ async function processMatchingLoop(takerOrder) {
     // 4. Get the maker order's data
     const makerOrderJSON = await redis.hget('orders', makerOrderId);
     if (!makerOrderJSON) {
-      // Order was in the list but not the hash? Bad state.
       console.warn(`Orphan order ID found: ${makerOrderId}. Skipping.`);
       continue;
     }
 
+    // --- CORRECTION (Bug 1 Fix) ---
+    // We now correctly parse the data from the hash
+    const makerData = JSON.parse(makerOrderJSON);
     const makerOrder = {
-      ...JSON.parse(makerOrderJSON),
+      ...makerData, // Contains client_id, quantity, created_at, total_filled_quantity
       order_id: makerOrderId,
       side: opposingSide,
       price: tradePrice,
     };
-    makerOrder.quantity = Number(makerOrder.quantity);
-    makerOrder.original_filled_quantity = Number(makerOrder.filled_quantity) || 0;
+    makerOrder.quantity = Number(makerData.quantity); // This is the *remaining* qty
+    // This is the *total filled qty* from when it was last on the book
+    makerOrder.total_filled_quantity = Number(makerData.total_filled_quantity) || 0; 
+    // --- END CORRECTION ---
 
     // 5. Calculate trade quantities
     const takerQtyNeeded = takerOrder.quantity - takerOrder.filled_quantity;
-    const makerQtyAvailable = makerOrder.quantity; // This is the *remaining* qty on the book
+    const makerQtyAvailable = makerOrder.quantity;
     
     const tradeQty = Math.min(takerQtyNeeded, makerQtyAvailable);
     if (tradeQty <= EPSILON) continue; // Skip if trade is too small
@@ -183,14 +176,17 @@ async function processMatchingLoop(takerOrder) {
       sell_order_id: (takerOrder.side === 'sell') ? takerOrder.order_id : makerOrder.order_id,
     };
     await persistence.createTrade(tradeData);
-    // await broadcast.publishTrade(tradeData); // Uncomment when ready
+    // await broadcast.publishTrade(tradeData);
 
     // 7. Update taker order (in memory)
     takerOrder.filled_quantity += tradeQty;
 
     // 8. Update maker order (in Redis and Postgres)
     const makerNewRemainingQty = makerOrder.quantity - tradeQty;
-    const makerNewFilledQty = makerOrder.original_filled_quantity + tradeQty;
+    // --- CORRECTION (Bug 1 Fix) ---
+    // This now correctly calculates the new *total* filled amount
+    const makerNewFilledQty = makerOrder.total_filled_quantity + tradeQty;
+    // --- END CORRECTION ---
 
     if (makerNewRemainingQty <= EPSILON) {
       // Maker order is fully FILLED
@@ -199,12 +195,19 @@ async function processMatchingLoop(takerOrder) {
       // await broadcast.publishOrderUpdate(...);
     } else {
       // Maker order is PARTIALLY FILLED
-      // Update its remaining quantity in the hash
-      makerOrder.quantity = makerNewRemainingQty;
-      await redis.hset('orders', makerOrder.order_id, JSON.stringify(makerOrder));
+
+      // --- CORRECTION (Bug 2 Fix) ---
+      // We create a clean, correct object to save back to the hash
+      const makerDataToSave = {
+        client_id: makerOrder.client_id,
+        quantity: makerNewRemainingQty, // The new remaining qty
+        created_at: makerOrder.created_at,
+        total_filled_quantity: makerNewFilledQty // The new total filled qty
+      };
+      await redis.hset('orders', makerOrder.order_id, JSON.stringify(makerDataToSave));
+      // --- END CORRECTION ---
       
       // **Put it back at the FRONT of the list (LPUSH)**
-      // It keeps its time-priority over new orders at this price
       await redis.lpush(priceListKey, makerOrder.order_id);
       
       await persistence.updateOrderStatus(makerOrder.order_id, 'partially_filled', makerNewFilledQty);
@@ -232,18 +235,24 @@ async function processMatchingLoop(takerOrder) {
  * Adds a new LIMIT order to the resting book in Redis.
  */
 async function addOrderToBook(order) {
-  const { order_id, price, side, quantity, client_id, created_at } = order;
+  // --- CORRECTION ---
+  // We now correctly use the 'total_filled_quantity' from the restingOrder object
+  const { order_id, price, side, quantity, client_id, created_at, total_filled_quantity } = order;
   const bookSide = (side === 'buy') ? 'bids' : 'asks';
+  // --- END CORRECTION ---
+
   const pricesKey = `${bookSide}:prices`;
   const priceListKey = `${bookSide}:${price}`;
 
+  // --- CORRECTION ---
+  // The data saved to the hash now includes the correct total_filled_quantity
   const orderData = JSON.stringify({
     client_id,
     quantity, // This is the *remaining* quantity
     created_at,
-    // We store original filled quantity to track fills
-    original_filled_quantity: order.filled_quantity 
+    total_filled_quantity: total_filled_quantity || 0 // Store current total filled
   });
+  // --- END CORRECTION ---
 
   // Use a MULTI transaction for atomicity
   try {

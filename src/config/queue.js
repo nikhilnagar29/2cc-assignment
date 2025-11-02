@@ -1,23 +1,26 @@
 // src/config/queue.js
 const { Queue, Worker } = require('bullmq');
-const { createClient } = require('./redis');
+// Import the createClient function
+const { createClient } = require('./redis'); 
 
 const QUEUE_NAME = 'order-processing';
 
-// 1. The Queue
-// This is what you use to ADD jobs
+// 1. The Queue — used to ADD jobs
 const orderQueue = new Queue(QUEUE_NAME, {
-  connection: createClient(),
+  // --- THIS IS THE FIX ---
+  // Give it its own, new connection
+  connection: createClient(), 
 });
 
-// 2. The Worker
-// This is what you use to PROCESS jobs
-// We define the processor function in matching.engine.js
+// 2. The Worker — used to PROCESS jobs
 const createOrderWorker = (processor) => {
   const worker = new Worker(QUEUE_NAME, processor, {
-    connection: createClient(),
-    concurrency: 1, // **CRITICAL: Process only 1 job at a time**
-    limiter: {      // Rate limit to match assignment targets
+    // --- THIS IS THE FIX ---
+    // Give the worker its own, separate connection
+    connection: createClient(), 
+    
+    concurrency: 1,          // CRITICAL: one job at a time
+    limiter: {               // Rate limit to match assignment load
       max: 2000,
       duration: 1000,
     },
