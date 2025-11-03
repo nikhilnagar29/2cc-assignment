@@ -3,37 +3,50 @@ const { createOrderWorker } = require('../config/queue');
 const persistence = require('./persistence.service');
 const redis = require('../config/redis').connection;
 // const broadcast = require('./broadcast.service'); // Uncomment when ready
+const { metrics } = require('./metrics.service');
 
 // A small number for safe floating-point comparisons
 const EPSILON = 1e-8;
 
-/**
- * The core logic for processing a single order from the queue.
- */
+// --- Job Processor Function ---
 async function processOrderJob(job) {
-  // Cast to Number for safe math, as Postgres/Redis can return strings
-  const order = {
-    ...job.data,
-    price: Number(job.data.price) || null, // Ensure null price for market orders
-    quantity: Number(job.data.quantity),
-    filled_quantity: Number(job.data.filled_quantity)
-  };
-
-  console.log(`[JOB ${job.id}] Processing order ${order.order_id}...`);
-
+  // --- MODIFICATION: Check the job name ---
+  const jobName = job.name;
+  const orderData = job.data;
+  const jobId = job.id;
+  const endTimer = metrics.order_latency_seconds.startTimer();
+  
   try {
-    let finalOrder;
-    if (order.type === 'market') {
-      finalOrder = await matchMarketOrder(order);
-    } else {
-      finalOrder = await matchLimitOrder(order);
+    if (jobName === 'process-order') {
+      // --- This is the original logic for a new order ---
+      const order = {
+        ...orderData,
+        price: Number(orderData.price) || null,
+        quantity: Number(orderData.quantity),
+        filled_quantity: Number(orderData.filled_quantity)
+      };
+      
+      console.log(`[JOB ${jobId}] Processing NEW order ${order.order_id}...`);
+      let finalOrder;
+      if (order.type === 'market') {
+        finalOrder = await matchMarketOrder(order);
+      } else {
+        finalOrder = await matchLimitOrder(order);
+      }
+      console.log(`[JOB ${jobId}] Finished order ${finalOrder.order_id}. Final Status: ${finalOrder.status}`);
+    
+    } else if (jobName === 'process-cancellation') {
+      // --- This is the new logic for a cancellation ---
+      console.log(`[JOB ${jobId}] Processing CANCELLATION for order ${orderData.order_id}...`);
+      await handleCancelJob(orderData.order_id);
+      console.log(`[JOB ${jobId}] Finished CANCELLATION for order ${orderData.order_id}.`);
     }
-    console.log(`[JOB ${job.id}] Finished order ${finalOrder.order_id}. Final Status: ${finalOrder.status}`);
+
   } catch (error) {
-    console.error(`[JOB ${job.id}] CRITICAL ERROR processing order ${order.order_id}:`, error);
-    // Throwing an error tells BullMQ the job failed
-    // It will be retried automatically if configured
+    console.error(`[JOB ${jobId}] CRITICAL ERROR processing ${jobName} for order ${orderData.order_id}:`, error);
     throw error;
+  } finally {
+    endTimer(); // Stop the latency timer
   }
 }
 
@@ -146,19 +159,15 @@ async function processMatchingLoop(takerOrder) {
       continue;
     }
 
-    // --- CORRECTION (Bug 1 Fix) ---
-    // We now correctly parse the data from the hash
     const makerData = JSON.parse(makerOrderJSON);
     const makerOrder = {
-      ...makerData, // Contains client_id, quantity, created_at, total_filled_quantity
+      ...makerData,
       order_id: makerOrderId,
       side: opposingSide,
       price: tradePrice,
     };
-    makerOrder.quantity = Number(makerData.quantity); // This is the *remaining* qty
-    // This is the *total filled qty* from when it was last on the book
+    makerOrder.quantity = Number(makerData.quantity);
     makerOrder.total_filled_quantity = Number(makerData.total_filled_quantity) || 0; 
-    // --- END CORRECTION ---
 
     // 5. Calculate trade quantities
     const takerQtyNeeded = takerOrder.quantity - takerOrder.filled_quantity;
@@ -178,15 +187,19 @@ async function processMatchingLoop(takerOrder) {
     await persistence.createTrade(tradeData);
     // await broadcast.publishTrade(tradeData);
 
+    metrics.orders_matched_total.inc();
+
+    // --- FIX #1: SUBTRACT the traded quantity from the depth hash ---
+    const depthKey = `${opposingSide}:depth`;
+    await redis.hincrbyfloat(depthKey, tradePrice, -tradeQty);
+    // --- END FIX ---
+
     // 7. Update taker order (in memory)
     takerOrder.filled_quantity += tradeQty;
 
     // 8. Update maker order (in Redis and Postgres)
     const makerNewRemainingQty = makerOrder.quantity - tradeQty;
-    // --- CORRECTION (Bug 1 Fix) ---
-    // This now correctly calculates the new *total* filled amount
     const makerNewFilledQty = makerOrder.total_filled_quantity + tradeQty;
-    // --- END CORRECTION ---
 
     if (makerNewRemainingQty <= EPSILON) {
       // Maker order is fully FILLED
@@ -195,17 +208,13 @@ async function processMatchingLoop(takerOrder) {
       // await broadcast.publishOrderUpdate(...);
     } else {
       // Maker order is PARTIALLY FILLED
-
-      // --- CORRECTION (Bug 2 Fix) ---
-      // We create a clean, correct object to save back to the hash
       const makerDataToSave = {
         client_id: makerOrder.client_id,
-        quantity: makerNewRemainingQty, // The new remaining qty
+        quantity: makerNewRemainingQty,
         created_at: makerOrder.created_at,
-        total_filled_quantity: makerNewFilledQty // The new total filled qty
+        total_filled_quantity: makerNewFilledQty
       };
       await redis.hset('orders', makerOrder.order_id, JSON.stringify(makerDataToSave));
-      // --- END CORRECTION ---
       
       // **Put it back at the FRONT of the list (LPUSH)**
       await redis.lpush(priceListKey, makerOrder.order_id);
@@ -225,6 +234,8 @@ async function processMatchingLoop(takerOrder) {
     }
   }
 
+
+
   // Return the taker order with its new filled_quantity
   return takerOrder;
 }
@@ -235,24 +246,19 @@ async function processMatchingLoop(takerOrder) {
  * Adds a new LIMIT order to the resting book in Redis.
  */
 async function addOrderToBook(order) {
-  // --- CORRECTION ---
-  // We now correctly use the 'total_filled_quantity' from the restingOrder object
   const { order_id, price, side, quantity, client_id, created_at, total_filled_quantity } = order;
+  
   const bookSide = (side === 'buy') ? 'bids' : 'asks';
-  // --- END CORRECTION ---
-
   const pricesKey = `${bookSide}:prices`;
   const priceListKey = `${bookSide}:${price}`;
+  const depthKey = `${bookSide}:depth`; // The key for the depth hash
 
-  // --- CORRECTION ---
-  // The data saved to the hash now includes the correct total_filled_quantity
   const orderData = JSON.stringify({
     client_id,
     quantity, // This is the *remaining* quantity
     created_at,
     total_filled_quantity: total_filled_quantity || 0 // Store current total filled
   });
-  // --- END CORRECTION ---
 
   // Use a MULTI transaction for atomicity
   try {
@@ -260,12 +266,81 @@ async function addOrderToBook(order) {
       .hset('orders', order_id, orderData)         // Add order data to hash
       .zadd(pricesKey, price, price)           // Add price to sorted set
       .rpush(priceListKey, order_id)           // Add order to end of list (time priority)
+      
+      // --- FIX #2: ADD the new quantity to the depth hash ---
+      .hincrbyfloat(depthKey, price, quantity)
+      // --- END FIX ---
+      
       .exec();
   } catch (err) {
     console.error(`Failed to add order ${order_id} to book:`, err);
     throw new Error('Failed to update Redis order book.');
   }
 }
+
+/**
+ * Safely removes an order from the live Redis order book.
+ * This runs inside the single-threaded worker, so it's safe from race conditions.
+ * @param {string} orderId The ID of the order to remove.
+ */
+async function handleCancelJob(orderId) {
+  // 1. Check if the order is *still* in the live book (it might have been filled)
+  const orderJSON = await redis.hget('orders', orderId);
+
+  if (!orderJSON) {
+    // This is not an error. It just means the order was fully filled
+    // by a previous job before this cancellation job could run.
+    console.log(`Order ${orderId} not found in live book. Already filled.`);
+    return; // The job is done.
+  }
+  
+  // 2. Order is still live. We must remove it.
+  const orderData = JSON.parse(orderJSON);
+  const { quantity, total_filled_quantity } = orderData;
+  
+  // We need to get the price and side from the master Postgres record
+  const pgOrder = await persistence.getOrderById(orderId);
+  if (!pgOrder) throw new Error(`Cannot find Postgres record for live order ${orderId}`);
+  
+  const { side, price } = pgOrder;
+  const bookSide = (side === 'buy') ? 'bids' : 'asks';
+  const pricesKey = `${bookSide}:prices`;
+  const priceListKey = `${bookSide}:${price}`;
+  const depthKey = `${bookSide}:depth`;
+
+  // 3. Use a MULTI transaction to remove the order atomically
+  try {
+    const pipeline = redis.multi();
+    
+    // a. Remove from the price LIST
+    pipeline.lrem(priceListKey, 1, orderId); // Remove 1 instance of orderId
+    
+    // b. Remove from the HASH
+    pipeline.hdel('orders', orderId);
+    
+    // c. Subtract its quantity from the DEPTH hash
+    pipeline.hincrbyfloat(depthKey, price, -Number(quantity));
+    
+    await pipeline.exec();
+
+    // 4. Check if the price level is now empty
+    const listLength = await redis.llen(priceListKey);
+    if (listLength === 0) {
+      // Clean up the empty price level from the ZSET
+      await redis.zrem(pricesKey, price);
+    }
+    
+    // 5. Update the master Postgres record to 'cancelled'
+    await persistence.updateOrderStatus(orderId, 'cancelled', total_filled_quantity);
+    
+    // await broadcast.publishOrderUpdate(...); // Uncomment when ready
+
+  } catch (err) {
+    console.error(`Failed to remove order ${orderId} from book:`, err);
+    throw new Error('Failed to update Redis order book during cancellation.');
+  }
+}
+
 
 // --- Worker Initialization ---
 const orderWorker = createOrderWorker(processOrderJob);

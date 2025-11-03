@@ -104,10 +104,186 @@ async function updateOrderStatus(orderId, newStatus, newFilledQuantity) {
   }
 }
 
+
+/**
+ * Fetches and formats the order book from Redis.
+ * This version calculates totals manually without a 'depth' hash.
+ * @param {number} levels - The number of price levels to fetch.
+ */
+async function getFormattedOrderBook(levels) {
+  // 1. Get the top N price levels
+  const [askPrices, bidPrices] = await redis.pipeline()
+    .zrange('asks:prices', 0, levels - 1)    // Asks: Lowest prices first
+    .zrevrange('bids:prices', 0, levels - 1) // Bids: Highest prices first
+    .exec();
+
+  const askPriceList = askPrices[1] || [];
+  const bidPriceList = bidPrices[1] || [];
+
+  // 2. Build pipeline to get all order IDs from all relevant price LISTs
+  const idPipeline = redis.pipeline();
+  askPriceList.forEach(price => idPipeline.lrange(`asks:${price}`, 0, -1));
+  bidPriceList.forEach(price => idPipeline.lrange(`bids:${price}`, 0, -1));
+  
+  if (askPriceList.length === 0 && bidPriceList.length === 0) {
+    return { asks: [], bids: [] }; // No prices, book is empty
+  }
+
+  const idResults = await idPipeline.exec();
+
+  // 3. Extract all order IDs and build pipeline to get their data from the HASH
+  let allOrderIds = [];
+  const askIdLists = idResults.slice(0, askPriceList.length).map(res => res[1] || []);
+  const bidIdLists = idResults.slice(askPriceList.length).map(res => res[1] || []);
+
+  askIdLists.forEach(list => allOrderIds.push(...list));
+  bidIdLists.forEach(list => allOrderIds.push(...list));
+
+  const uniqueOrderIds = [...new Set(allOrderIds)];
+
+  if (uniqueOrderIds.length === 0) {
+    return { asks: [], bids: [] }; // No orders in the lists, book is empty
+  }
+
+  // 4. Get all order details from the 'orders' HASH
+  const orderDetailsList = await redis.hmget('orders', ...uniqueOrderIds);
+
+  // 5. Create a simple map (orderId -> quantity) for fast lookup
+  const orderQtyMap = new Map();
+  orderDetailsList.forEach((json, index) => {
+    if (json) {
+      try {
+        const data = JSON.parse(json);
+        orderQtyMap.set(uniqueOrderIds[index], parseFloat(data.quantity) || 0);
+      } catch (e) {
+        orderQtyMap.set(uniqueOrderIds[index], 0);
+      }
+    }
+  });
+
+  // 6. Format, parse, and calculate cumulative depth
+  const formatSide = (priceList, idLists) => {
+    let cumulative = 0;
+    return priceList.map((price, index) => {
+      const orderIds = idLists[index];
+      let totalQuantity = 0;
+      
+      // Sum quantities for all orders at this price level
+      orderIds.forEach(id => {
+        totalQuantity += orderQtyMap.get(id) || 0;
+      });
+
+      cumulative += totalQuantity;
+      return {
+        price: parseFloat(price),
+        quantity: totalQuantity,
+        cumulative: cumulative,
+      };
+    }).filter(level => level.quantity > 0); // Don't show empty levels
+  };
+
+  return {
+    asks: formatSide(askPriceList, askIdLists),
+    bids: formatSide(bidPriceList, bidIdLists),
+  };
+}
+
+
+/**
+ * Fetches the most recent trades from the 'trades' table.
+ * @param {number} limit - The number of trades to fetch.
+ * @returns {Promise<Array<object>>} A list of trade objects.
+ */
+async function getRecentTrades(limit = 50) {
+  const sql = `
+    SELECT * FROM trades
+    ORDER BY "timestamp" DESC
+    LIMIT $1;
+  `;
+  
+  try {
+    const { rows } = await db.query(sql, [limit]);
+    return rows;
+  } catch (err) {
+    console.error('Error fetching recent trades:', err);
+    throw new Error('Failed to fetch trades.');
+  }
+}
+
+/**
+ * Fetches recent trades, joining with the orders table to get client IDs.
+ * @param {number} limit - The number of trades to fetch.
+ * @returns {Promise<Array<object>>} A list of detailed trade objects.
+ */
+async function getDetailedTrades(limit = 50) {
+  // This SQL query joins the 'trades' table with the 'orders' table *twice*.
+  // Once to get the buyer's client_id and once for the seller's.
+  const sql = `
+    SELECT
+      t.trade_id,
+      t.price,
+      t.quantity,
+      t."timestamp",
+      t.instrument,
+      buyer_order.client_id AS buy_client_id,
+      seller_order.client_id AS sell_client_id
+    FROM
+      trades AS t
+    JOIN
+      orders AS buyer_order ON t.buy_order_id = buyer_order.order_id
+    JOIN
+      orders AS seller_order ON t.sell_order_id = seller_order.order_id
+    ORDER BY
+      t."timestamp" DESC
+    LIMIT $1;
+  `;
+  
+  try {
+    const { rows } = await db.query(sql, [limit]);
+    return rows;
+  } catch (err) {
+    console.error('Error fetching detailed trades:', err);
+    throw new Error('Failed to fetch detailed trades.');
+  }
+}
+
+/**
+ * Fetches a single order by its UUID.
+ * @param {string} orderId - The UUID of the order to fetch.
+ * @returns {Promise<object | undefined>} The order object, or undefined if not found.
+ */
+async function getOrderById(orderId) {
+  const sql = `
+    SELECT * FROM orders
+    WHERE order_id = $1;
+  `;
+  
+  try {
+    const { rows } = await db.query(sql, [orderId]);
+    return rows[0]; // Returns the order or undefined
+  } catch (err) {
+    console.error(`Error fetching order ${orderId}:`, err);
+    throw new Error('Failed to fetch order.');
+  }
+}
+
+// --- Add the new function to your exports ---
+module.exports = {
+  // ... (all your other exports)
+  getDetailedTrades,
+  getOrderById // <-- ADD THIS
+};
+
+
+
 module.exports = {
   checkIdempotency,
   saveNewOrder,
   createTrade,
-  updateOrderStatus
+  updateOrderStatus,
+  getFormattedOrderBook,
+  getRecentTrades,
+  getDetailedTrades,
+  getOrderById
   // ... other functions like getOrder, getOpenOrders, etc.
 };
