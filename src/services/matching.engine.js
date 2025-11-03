@@ -2,6 +2,7 @@
 const { createOrderWorker } = require('../config/queue');
 const persistence = require('./persistence.service');
 const redis = require('../config/redis').connection;
+const broadcast = require('./broadcast.service');
 // const broadcast = require('./broadcast.service'); // Uncomment when ready
 const { metrics } = require('./metrics.service');
 
@@ -184,8 +185,9 @@ async function processMatchingLoop(takerOrder) {
       buy_order_id: (takerOrder.side === 'buy') ? takerOrder.order_id : makerOrder.order_id,
       sell_order_id: (takerOrder.side === 'sell') ? takerOrder.order_id : makerOrder.order_id,
     };
-    await persistence.createTrade(tradeData);
-    // await broadcast.publishTrade(tradeData);
+    const newTrade = await persistence.createTrade(tradeData);
+
+    broadcast.publishTrade(newTrade);
 
     metrics.orders_matched_total.inc();
 
@@ -204,8 +206,11 @@ async function processMatchingLoop(takerOrder) {
     if (makerNewRemainingQty <= EPSILON) {
       // Maker order is fully FILLED
       await redis.hdel('orders', makerOrder.order_id);
-      await persistence.updateOrderStatus(makerOrder.order_id, 'filled', makerNewFilledQty);
+      const updatedMakerOrder = await persistence.updateOrderStatus(makerOrder.order_id, 'filled', makerNewFilledQty);
       // await broadcast.publishOrderUpdate(...);
+
+      broadcast.publishOrderUpdate(updatedMakerOrder);
+
     } else {
       // Maker order is PARTIALLY FILLED
       const makerDataToSave = {
@@ -219,18 +224,31 @@ async function processMatchingLoop(takerOrder) {
       // **Put it back at the FRONT of the list (LPUSH)**
       await redis.lpush(priceListKey, makerOrder.order_id);
       
-      await persistence.updateOrderStatus(makerOrder.order_id, 'partially_filled', makerNewFilledQty);
+      const updatedMakerOrder = await persistence.updateOrderStatus(makerOrder.order_id, 'partially_filled', makerNewFilledQty);
       // await broadcast.publishOrderUpdate(...);
+
+      broadcast.publishOrderUpdate(updatedMakerOrder);
     }
 
     // Update taker status in Postgres (so UI can see partial fills in real-time)
-    await persistence.updateOrderStatus(takerOrder.order_id, 'partially_filled', takerOrder.filled_quantity);
+    const updatedTakerOrder = await persistence.updateOrderStatus(takerOrder.order_id, 'partially_filled', takerOrder.filled_quantity);
     // await broadcast.publishOrderUpdate(...);
+
+    broadcast.publishOrderUpdate(updatedTakerOrder);
 
     // 9. If list for this price is now empty, remove price from ZSET
     const listLength = await redis.llen(priceListKey);
     if (listLength === 0) {
       await redis.zrem(pricesKey, bestPrice);
+
+      broadcast.publishBookDelta({ side: opposingSide, price: tradePrice, new_quantity: "0" }); // <-- 6. ADD THIS
+    }
+    else {
+      // If the list is NOT empty, we still send an update
+      // (This assumes you are *not* using the depth hash, which is slower)
+      // (If you *are* using the depth hash, this logic is simpler)
+      const newDepth = await redis.hget(`${opposingSide}:depth`, tradePrice);
+      broadcast.publishBookDelta({ side: opposingSide, price: tradePrice, new_quantity: newDepth || "0" }); // <-- 7. ADD THIS
     }
   }
 
@@ -331,9 +349,10 @@ async function handleCancelJob(orderId) {
     }
     
     // 5. Update the master Postgres record to 'cancelled'
-    await persistence.updateOrderStatus(orderId, 'cancelled', total_filled_quantity);
+    const updatedOrder = await persistence.updateOrderStatus(orderId, 'cancelled', total_filled_quantity);
     
     // await broadcast.publishOrderUpdate(...); // Uncomment when ready
+    broadcast.publishOrderUpdate(updatedOrder);
 
   } catch (err) {
     console.error(`Failed to remove order ${orderId} from book:`, err);

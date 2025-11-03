@@ -1,10 +1,12 @@
 // src/server.js
 require('dotenv').config(); // MUST be first
 
+const http = require('http');
 const express = require('express');
 const apiRoutes = require('./api/routes');
 const orderWorker = require('./services/matching.engine');
 const db = require('./config/postgres'); // <-- Import your new DB config
+const broadcastService = require('./services/broadcast.service'); // 2. Import the service
 
 // --- Bull Board UI Setup ---
 const { createBullBoard } = require('@bull-board/api');
@@ -22,9 +24,14 @@ createBullBoard({
 
 // --- App Setup ---
 const app = express();
+const server = http.createServer(app);
+
 app.use(express.json());
 app.use('/', apiRoutes);
 app.use('/admin/queues', serverAdapter.getRouter());
+
+broadcastService.initialize(server);
+
 
 // --- New Start Server Function ---
 async function startServer() {
@@ -34,10 +41,11 @@ async function startServer() {
     
     // 2. If DB is OK, start the server
     const PORT = process.env.PORT || 3000;
-    app.listen(PORT, () => {
+    server.listen(PORT, () => {
       console.log(`Server is running on http://localhost:${PORT}`);
       console.log('Order processing queue is active.');
       console.log(`BullMQ UI available at http://localhost:${PORT}/admin/queues`);
+      console.log(`WebSocket stream available at ws://localhost:${PORT}`); // New log
     });
 
   } catch (err) {
