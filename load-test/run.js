@@ -3,8 +3,8 @@ const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
 
 const TARGET_URL = 'http://localhost:3000/orders';
-const TOTAL_REQUESTS = 10000; // --- CHANGED to 10,000 ---
-const CONCURRENCY_LIMIT = 200; // How many requests to send at once
+const TOTAL_REQUESTS = 50000; // --- CHANGED to 10,000 ---
+const CONCURRENCY_LIMIT = 300; // How many requests to send at once
 
 const latencies = [];
 let successCount = 0;
